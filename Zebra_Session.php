@@ -231,7 +231,7 @@ class Zebra_Session
         $this->link = $link;
 
         // continue if there is an active MySQL connection
-        if ($this->_mysql_ping()) {
+        if ($this->_pdo_ping()) {
 
             // make sure session cookies never expire so that session lifetime
             // will depend only on the value of $session_lifetime
@@ -308,7 +308,7 @@ class Zebra_Session
 
         // if no MySQL connections could be found
         // trigger a fatal error message and stop execution
-        } else trigger_error('Zebra_Session: No MySQL connection!', E_USER_ERROR);
+    } else trigger_error('Zebra_Session: No PDO connection!', E_USER_ERROR);
 
     }
 
@@ -341,16 +341,18 @@ class Zebra_Session
         $this->gc();
 
         // counts the rows from the database
-        $result = @mysqli_fetch_assoc($this->_mysql_query('
+        $result = $this->link->query('
 
             SELECT
                 COUNT(session_id) as count
             FROM ' . $this->table_name . '
 
-        ')) or die(_mysql_error());
+        ') or die(_pdo_error());
+        
+        $row = $result->fetch(PDO::FETCH_ASSOC);
 
         // return the number of found rows
-        return $result['count'];
+        return $row['count'];
 
     }
 
@@ -525,10 +527,10 @@ class Zebra_Session
     {
 
         // release the lock associated with the current session
-        $this->_mysql_query('SELECT RELEASE_LOCK("' . $this->session_lock . '")')
+        $this->link->query('SELECT RELEASE_LOCK("' . $this->session_lock . '")')
 
             // stop execution and print message on error
-            or die($this->_mysql_error());
+            or die($this->_pdo_error());
 
         return true;
 
@@ -543,18 +545,18 @@ class Zebra_Session
     {
 
         // deletes the current session id from the database
-        $result = $this->_mysql_query('
+        $result = $this->link->query('
 
             DELETE FROM
                 ' . $this->table_name . '
             WHERE
-                session_id = "' . $this->_mysql_real_escape_string($session_id) . '"
+                session_id = ' . $this->link->quote($session_id) . '
 
-        ') or die($this->_mysql_error());
+        ') or die($this->_pdo_error());
 
         // if anything happened
         // return true
-        if ($this->_mysql_affected_rows() !== -1) return true;
+        if ($result->rowCount() !== -1) return true;
 
         // if something went wrong, return false
         return false;
@@ -570,14 +572,14 @@ class Zebra_Session
     {
 
         // deletes expired sessions from database
-        $result = $this->_mysql_query('
+        $result = $this->link->query('
 
             DELETE FROM
                 ' . $this->table_name . '
             WHERE
-                session_expire < "' . $this->_mysql_real_escape_string(time()) . '"
+                session_expire < ' . $this->link->quote(time()) . '
 
-        ') or die($this->_mysql_error());
+        ') or die($this->_pdo_error());
 
     }
 
@@ -602,14 +604,16 @@ class Zebra_Session
     {
 
         // get the lock name, associated with the current session
-        $this->session_lock = $this->_mysql_real_escape_string('session_' . $session_id);
+        $this->session_lock = $this->link->quote('session_' . $session_id);
 
         // try to obtain a lock with the given name and timeout
-        $result = $this->_mysql_query('SELECT GET_LOCK("' . $this->session_lock . '", ' . $this->_mysql_real_escape_string($this->lock_timeout) . ')');
-
+        $result = $this->_pdo_query('SELECT GET_LOCK("' . $this->session_lock . '", ' . $this->link->quote($this->lock_timeout) . ') as get_lock');
+        
         // if there was an error
         // stop execution
-        if (!is_object($result) || strtolower(get_class($result)) != 'mysqli_result' || @mysqli_num_rows($result) != 1 || !($row = mysqli_fetch_array($result)) || $row[0] != 1) die('Zebra_Session: Could not obtain session lock!');
+        //if (!is_object($result) || strtolower(get_class($result)) != 'mysqli_result' || @mysqli_num_rows($result) != 1 || !($row = mysqli_fetch_array($result)) || $row[0] != 1) die('Zebra_Session: Could not obtain session lock!');
+        $rows = $result->fetchAll(PDO::FETCH_ASSOC);
+        if (!is_object($result) || count(@$rows) != 1 || $rows[0]['get_lock'] != 1) die('Zebra_Session: Could not obtain session lock!');
 
         //  reads session data associated with a session id, but only if
         //  -   the session ID exists;
@@ -631,28 +635,25 @@ class Zebra_Session
         // append this to the end
         $hash .= $this->security_code;
 
-        $result = $this->_mysql_query('
+        $result = $this->_pdo_query('
 
             SELECT
                 session_data
             FROM
                 ' . $this->table_name . '
             WHERE
-                session_id = "' . $this->_mysql_real_escape_string($session_id) . '" AND
-                session_expire > "' . time() . '" AND
-                hash = "' . $this->_mysql_real_escape_string(md5($hash)) . '"
+                session_id = ' . $this->link->quote($session_id) . ' AND
+                session_expire > ' . time() . ' AND
+                hash = ' . $this->link->quote(md5($hash)) . '
             LIMIT 1
 
-        ') or die($this->_mysql_error());
+        ') or die($this->_pdo_error());
 
-        // if anything was found
-        if (is_object($result) && strtolower(get_class($result)) == 'mysqli_result' && @mysqli_num_rows($result) > 0) {
+        $rows = $result->fetchAll(PDO::FETCH_ASSOC);
 
-            // return found data
-            $fields = @mysqli_fetch_assoc($result);
+        if (is_object($result) && count(@$rows) == 1) {
 
-            // don't bother with the unserialization - PHP handles this automatically
-            return $fields['session_data'];
+            return $rows[0]['session_data'];
 
         }
 
@@ -670,12 +671,12 @@ class Zebra_Session
      */
     function write($session_id, $session_data)
     {
-
+        
         // insert OR update session's data - this is how it works:
         // first it tries to insert a new row in the database BUT if session_id is already in the database then just
         // update session_data and session_expire for that specific session_id
         // read more here http://dev.mysql.com/doc/refman/4.1/en/insert-on-duplicate.html
-        $result = $this->_mysql_query('
+        $result = $this->_pdo_query('
 
             INSERT INTO
                 ' . $this->table_name . ' (
@@ -685,27 +686,27 @@ class Zebra_Session
                     session_expire
                 )
             VALUES (
-                "' . $this->_mysql_real_escape_string($session_id) . '",
-                "' . $this->_mysql_real_escape_string(md5(($this->lock_to_user_agent && isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '') . ($this->lock_to_ip && isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '') . $this->security_code)) . '",
-                "' . $this->_mysql_real_escape_string($session_data) . '",
-                "' . $this->_mysql_real_escape_string(time() + $this->session_lifetime) . '"
+                ' . $this->link->quote($session_id) . ',
+                ' . $this->link->quote(md5(($this->lock_to_user_agent && isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '') . ($this->lock_to_ip && isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '') . $this->security_code)) . ',
+                ' . $this->link->quote($session_data) . ',
+                ' . $this->link->quote(time() + $this->session_lifetime) . '
             )
             ON DUPLICATE KEY UPDATE
-                session_data = "' . $this->_mysql_real_escape_string($session_data) . '",
-                session_expire = "' . $this->_mysql_real_escape_string(time() + $this->session_lifetime) . '"
+                session_data = ' . $this->link->quote($session_data) . ',
+                session_expire = ' . $this->link->quote(time() + $this->session_lifetime) . '
 
-        ') or die($this->_mysql_error());
-
+        ') or die($this->_pdo_error());
+        
         // if anything happened
         if ($result) {
-
+            
             // note that after this type of queries, mysqli_affected_rows() returns
             // - 1 if the row was inserted
             // - 2 if the row was updated
 
             // if the row was updated
             // return TRUE
-            if (@$this->_mysql_affected_rows() > 1) return true;
+            if (@$result->rowCount() > 0) return true;
 
             // if the row was inserted
             // return an empty string
@@ -759,28 +760,15 @@ class Zebra_Session
     }
 
     /**
-     *  Wrapper for PHP's "mysqli_affected_rows" function.
-     *
-     *  @access private
-     */
-    private function _mysql_affected_rows()
-    {
-
-        // execute "mysqli_affected_rows" and returns the result
-        return mysqli_affected_rows($this->link);
-
-    }
-
-    /**
      *  Wrapper for PHP's "mysqli_error" function.
      *
      *  @access private
      */
-    private function _mysql_error()
+    private function _pdo_error()
     {
 
-        // execute "mysqli_error" and returns the result
-        return 'Zebra_Session: ' . mysqli_error($this->link);
+        // return PDO error info
+        return 'Zebra_Session: ' . $this->link->errorInfo();
 
     }
 
@@ -789,11 +777,11 @@ class Zebra_Session
      *
      *  @access private
      */
-    private function _mysql_query($query)
+    private function _pdo_query($query)
     {
 
-        // execute "mysqli_query" and returns the result
-        return mysqli_query($this->link, $query);
+        // execute a PDO query and returns the result
+        return $this->link->query($query);
 
     }
 
@@ -802,24 +790,17 @@ class Zebra_Session
      *
      *  @access private
      */
-    private function _mysql_ping()
+    private function _pdo_ping()
     {
 
-        // execute "mysqli_ping" and returns the result
-        return mysqli_ping($this->link);
+        // execute a PDO "ping" and returns the result
+        try {
+            $this->_pdo_query('SELECT 1');
+        } catch (PDOException $e) {
+            $this->link->init();            // Don't catch exception here, so that re-connect fail will throw exception
+        }
 
-    }
-
-    /**
-     *  Wrapper for PHP's "mysqli_real_escape_string" function.
-     *
-     *  @access private
-     */
-    private function _mysql_real_escape_string($string)
-    {
-
-        // execute "mysqli_real_escape_string" and returns the result
-        return mysqli_real_escape_string($this->link, $string);
+        return true;
 
     }
 
